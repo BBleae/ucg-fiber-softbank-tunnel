@@ -64,6 +64,8 @@ iptables -w 10 -t nat -D POSTROUTING -s "$DSLITE_SRC" -o "$TUNNEL_NAME" -j SNAT 
 # Remove WAN2 failover default route from main table (if active)
 WAN2_GW=$(ip route show default 2>/dev/null | awk '/via/{print $3}')
 [[ -n "$WAN2_GW" ]] && ip route del default via "$WAN2_GW" 2>/dev/null || true
+# Remove IPv6 failover route (if active)
+ip -6 route del default metric 100 2>/dev/null || true
 log "WAN hack and failover rules removed."
 
 # ─── 5. 关闭隧道 ───

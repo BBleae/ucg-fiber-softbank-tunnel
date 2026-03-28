@@ -28,6 +28,9 @@ FAIL_THRESHOLD=3                      # 连续失败次数 (每15秒检查, 共4
 LOG="/var/log/tunnel-watchdog.log"
 MAX_LOG_BYTES=1048576                 # 1MB, 超过则轮转
 
+# ─── IPv6 故障切换 ───
+IPV6_FAILOVER=false  # LAN IPv6 前缀绑定主 WAN, 切出口后源地址不匹配; 仅当 WAN2 使用相同前缀时启用
+
 # ─── 端口转发 ───
 # 格式: "协议:外网端口:内网IP:内网端口"
 # 添加/删除端口转发只需修改此数组, watchdog 和 teardown 会自动适配

@@ -88,6 +88,11 @@ if $health_ok; then
         # Remove WAN2 failover route from main table before restoring tun4
         ip route del default via "$(ip route show default 2>/dev/null | awk '/via/{print $3}')" 2>/dev/null
         ip route replace default dev "$TUNNEL_NAME"
+        # Remove IPv6 failover route (eth4 RA route at metric 512 takes over automatically)
+        if [[ "${IPV6_FAILOVER:-false}" == "true" ]]; then
+            ip -6 route del default metric 100 2>/dev/null && \
+                log "WAN2 failover: IPv6 deactivated, eth4 RA route restored"
+        fi
         log "WAN2 failover: deactivated, $TUNNEL_NAME is primary again"
     fi
 
@@ -110,6 +115,14 @@ else
             if [[ -n "$WAN2_GW" && -n "$WAN2_DEV" ]]; then
                 ip route add default via "$WAN2_GW" dev "$WAN2_DEV" 2>/dev/null
                 log "WAN2 failover: activated default via $WAN2_GW dev $WAN2_DEV"
+                # IPv6 failover: add lower-metric default route via WAN2
+                if [[ "${IPV6_FAILOVER:-false}" == "true" ]]; then
+                    WAN2_GW6=$(ip -6 route show table 202.eth6 default 2>/dev/null | awk '{print $3}' | head -1)
+                    if [[ -n "$WAN2_GW6" ]]; then
+                        ip -6 route add default via "$WAN2_GW6" dev "$WAN2_DEV" metric 100 2>/dev/null
+                        log "WAN2 failover: IPv6 activated via $WAN2_GW6 dev $WAN2_DEV metric 100"
+                    fi
+                fi
             else
                 log "WAN2 failover: WARNING - no WAN2 gateway found in table 202.eth6"
             fi
