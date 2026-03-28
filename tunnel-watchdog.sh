@@ -99,10 +99,12 @@ else
     echo "$FAILS" > "${FAIL_COUNT_FILE}.tmp" && mv "${FAIL_COUNT_FILE}.tmp" "$FAIL_COUNT_FILE"
 
     if [[ $FAILS -ge $FAIL_THRESHOLD ]]; then
-        if ip route show default | grep -q "$TUNNEL_NAME"; then
-            log "tunnel unreachable ($FAILS failures), removing default route for WAN2 failover"
-            ip route del default dev "$TUNNEL_NAME" 2>/dev/null
-            # Add WAN2 default route to main table (ip rule gets cleared by UniFi)
+        # Remove tun4 default route if present
+        ip route del default dev "$TUNNEL_NAME" 2>/dev/null
+
+        # Ensure WAN2 failover route exists (covers both fresh failover and
+        # the case where tun4 was rebuilt but unhealthy with no default route)
+        if ! ip route show default | grep -q "via"; then
             WAN2_GW=$(ip route show table 202.eth6 default 2>/dev/null | awk '{print $3}')
             WAN2_DEV=$(ip route show table 202.eth6 default 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev")print $(i+1)}')
             if [[ -n "$WAN2_GW" && -n "$WAN2_DEV" ]]; then
