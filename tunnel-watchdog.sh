@@ -85,9 +85,10 @@ if $health_ok; then
     # Restore default route if it was removed during failover
     if ! ip route show default | grep -q "$TUNNEL_NAME"; then
         log "tunnel recovered, restoring default route via $TUNNEL_NAME"
+        # Remove WAN2 failover route from main table before restoring tun4
+        ip route del default via "$(ip route show default 2>/dev/null | awk '/via/{print $3}')" 2>/dev/null
         ip route replace default dev "$TUNNEL_NAME"
-        ip rule del from all lookup 202.eth6 prio 31999 2>/dev/null && \
-            log "WAN2 failover: deactivated, $TUNNEL_NAME is primary again"
+        log "WAN2 failover: deactivated, $TUNNEL_NAME is primary again"
     fi
 
     [[ "$PREV_FAILS" -ge "$FAIL_THRESHOLD" ]] && log "tunnel recovered after $PREV_FAILS failures"
@@ -101,10 +102,15 @@ else
         if ip route show default | grep -q "$TUNNEL_NAME"; then
             log "tunnel unreachable ($FAILS failures), removing default route for WAN2 failover"
             ip route del default dev "$TUNNEL_NAME" 2>/dev/null
-            ip rule show | grep -q "31999:" || {
-                ip rule add from all lookup 202.eth6 prio 31999
-                log "WAN2 failover: activated table 202.eth6"
-            }
+            # Add WAN2 default route to main table (ip rule gets cleared by UniFi)
+            WAN2_GW=$(ip route show table 202.eth6 default 2>/dev/null | awk '{print $3}')
+            WAN2_DEV=$(ip route show table 202.eth6 default 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev")print $(i+1)}')
+            if [[ -n "$WAN2_GW" && -n "$WAN2_DEV" ]]; then
+                ip route add default via "$WAN2_GW" dev "$WAN2_DEV" 2>/dev/null
+                log "WAN2 failover: activated default via $WAN2_GW dev $WAN2_DEV"
+            else
+                log "WAN2 failover: WARNING - no WAN2 gateway found in table 202.eth6"
+            fi
         fi
     else
         log "tunnel health check failed ($FAILS/$FAIL_THRESHOLD)"
