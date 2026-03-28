@@ -1,0 +1,37 @@
+#!/bin/bash
+# tunnel.conf.example — UCG-Fiber IPIP6 隧道共享配置 (示例)
+# 部署位置: /data/tunnel.conf
+# 被 tunnel-watchdog.sh 和 tunnel-teardown.sh 引用
+#
+# 使用方法: cp tunnel.conf.example tunnel.conf 然后填入实际值
+
+# ─── 隧道参数 ───
+TUNNEL_SRC="2001:db8:1::1"           # 本地 IPv6 地址 (eth4 上的 IPoE 地址)
+TUNNEL_DST="2001:db8:2::1"           # 隧道对端 IPv6 地址 (隧道服务商提供)
+TUNNEL_DEV="eth4"                     # 承载 IPv6 的物理接口
+TUNNEL_NAME="tun4"                    # 隧道接口名
+IPV4_ADDR="203.0.113.1"              # 隧道分配的公网 IPv4 地址
+MTU=1460
+
+# ─── 内网 ───
+LAN_SUBNET="192.168.1.0/24"
+
+# ─── WAN 状态 hack ───
+DSLITE_SRC="192.0.0.2"               # DS-Lite B4 地址 (通常不需要改)
+
+# ─── 健康检查 ───
+HEALTH_TARGETS=("8.8.8.8" "1.1.1.1") # 任一可达即视为健康
+FAIL_COUNT_FILE="/tmp/tun4-fail-count"
+FAIL_THRESHOLD=3                      # 连续失败次数 (每15秒检查, 共45秒) 后启用 WAN2 failover
+
+# ─── 日志 ───
+LOG="/var/log/tunnel-watchdog.log"
+MAX_LOG_BYTES=1048576                 # 1MB, 超过则轮转
+
+# ─── 端口转发 ───
+# 格式: "协议:外网端口:内网IP:内网端口"
+# 添加/删除端口转发只需修改此数组, watchdog 和 teardown 会自动适配
+PORT_FORWARDS=(
+    "tcp:443:192.168.1.100:443"       # HTTPS 反向代理
+    "tcp:25565:192.168.1.200:25565"   # Minecraft 服务器
+)

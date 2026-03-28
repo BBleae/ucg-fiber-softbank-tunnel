@@ -1,0 +1,7 @@
+[Unit]
+Description=IPIP6 tunnel watchdog
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/data/tunnel-watchdog.sh
