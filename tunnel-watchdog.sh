@@ -156,7 +156,27 @@ ipt_add -t nat -C POSTROUTING -s "$DSLITE_SRC" -o "$TUNNEL_NAME" -j SNAT --to-so
     log "WAN hack: added SNAT rule for $DSLITE_SRC"
 }
 
-# ─── 7. Port forwarding rules (from config, idempotent) ───
+# ─── 7. Fix miniupnpd external interface (ubios generates wrong ext_ifname) ───
+UPNPD_CONF="/run/miniupnpd.conf"
+if [[ -f "$UPNPD_CONF" ]] && grep -q "^ext_ifname=ip6tnl1" "$UPNPD_CONF"; then
+    log "miniupnpd: ext_ifname=ip6tnl1 detected, patching to $TUNNEL_NAME"
+    sed -i "s|^ext_ifname=ip6tnl1|ext_ifname=$TUNNEL_NAME|" "$UPNPD_CONF"
+    # Also ensure ext_ip is explicit (tun4 is a p2p if, miniupnpd may not read it correctly)
+    if ! grep -q "^ext_ip=" "$UPNPD_CONF"; then
+        echo "ext_ip=$IPV4_ADDR" >> "$UPNPD_CONF"
+    else
+        sed -i "s|^ext_ip=.*|ext_ip=$IPV4_ADDR|" "$UPNPD_CONF"
+    fi
+    # Restart miniupnpd with the corrected config
+    if kill -HUP "$(cat /var/run/miniupnpd.pid 2>/dev/null)" 2>/dev/null; then
+        log "miniupnpd: sent SIGHUP to reload config"
+    else
+        # SIGHUP not supported on some builds; kill and let systemd restart it
+        pkill -x miniupnpd 2>/dev/null && log "miniupnpd: restarted with correct ext_ifname=$TUNNEL_NAME"
+    fi
+fi
+
+# ─── 8. Port forwarding rules (from config, idempotent) ───
 for rule in "${PORT_FORWARDS[@]}"; do
     IFS=: read -r proto ext_port dest_ip dest_port <<< "$rule"
     # DNAT (external -> internal)
