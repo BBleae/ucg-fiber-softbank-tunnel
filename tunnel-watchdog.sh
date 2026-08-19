@@ -1,10 +1,24 @@
 #!/bin/bash
-# Tunnel watchdog v3 - IPIP6 tunnel + WAN status hack + failover support
+# Tunnel watchdog v4.1 - IPIP6 tunnel + WAN status hack + metric-competition failover
 # Runs every 15 seconds via systemd timer
+#
+# v4.1 (2026-08-19): 修复 v4 实现审查发现的 bug:
+#   - metric 归一化: 启动时显式迁移 legacy metric-0 tun4 default -> metric 200 (先加后删, 不空窗)
+#   - ensure_tun4_default 提前到健康检查前, 失败有日志 (修 H4)
+#   - WAN2 验证拆两段: pre-route(carrier+网关) + post-install(route get + 公网 ping), 失败只回滚 WAN2 route (修 C1/H2)
+#   - healthy 分支三态收敛: tun4 / eth6 / neither (修 C2)
+#   - read_uint 校验持久化计数, corrupt 回退 0 (修 set -u 崩溃)
+#   - dwell 用独立 timestamp 文件, 不依赖 marker (修 H3)
+#   - 网关单候选 + unicast 校验 (修 H6)
+#
+# 核心不变量: tun4 default (metric 200) 始终保留, 永不删除.
+#   failover  = 加 WAN2 default (metric 100, 更低=优先); 两条共存, 内核选 metric 100.
+#   recovery  = 删 WAN2 那条, tun4 metric 200 自动接管.
+#   (H4) ping -I tun4 健康检查永远有路由; (C1) 无 del-then-add 空窗; (C2) 每轮按 ip route get 收敛.
 
 set -u
 
-# ─── 配置 ───
+# --- 配置 ---
 CONF="/data/tunnel.conf"
 if [[ ! -f "$CONF" ]]; then
     echo "$(date): ERROR: config file $CONF not found" >&2
@@ -12,7 +26,7 @@ if [[ ! -f "$CONF" ]]; then
 fi
 source "$CONF"
 
-# ─── 单实例锁 ───
+# --- 单实例锁 ---
 LOCKFILE="/var/run/tunnel-watchdog.lock"
 exec 9>"$LOCKFILE"
 if ! flock -n 9; then
@@ -22,20 +36,57 @@ fi
 
 log() { echo "$(date): $*" >> "$LOG"; }
 
-# ─── 0. 日志轮转 ───
+# --- 0. 日志轮转 ---
 if [[ -f "$LOG" ]] && [[ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt "$MAX_LOG_BYTES" ]]; then
     mv "$LOG" "${LOG}.old"
     log "log rotated"
 fi
 
-# ─── 1. Ensure tunnel source IPv6 is on the physical interface ───
+# --- 配置变量 (含默认值, set -u 安全) ---
+WAN2_DEV_CFG="${WAN2_DEV:-eth6}"
+TUN_METRIC="${TUNNEL_ROUTE_METRIC:-200}"
+W2_METRIC="${WAN2_ROUTE_METRIC:-100}"
+FAILOVER_MIN_DWELL="${FAILOVER_MIN_DWELL_SEC:-60}"
+RECOVER_OK_TH="${RECOVER_OK_THRESHOLD:-3}"
+HEALTH_TO="${HEALTH_TIMEOUT:-3}"
+FAILOVER_MARKER="/tmp/tun4-failover-active"
+FAILOVER_TS_FILE="/tmp/tun4-failover-ts"      # dwell 时间戳, 独立于 marker
+RECOVER_OK_FILE="/tmp/tun4-recover-ok-count"
+
+# read_uint: 安全读取持久化数字, 只接受 ^[0-9]+$, 否则回退默认值 (修 set -u/arithmetic 崩溃)
+read_uint() {  # $1=file $2=default
+    local val
+    val=$(cat "$1" 2>/dev/null || true)
+    if [[ "$val" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$val"
+    else
+        printf '%s' "$2"
+    fi
+}
+
+# 验证 IPv4 单播 (H6): 排除 0/8, 127/8, 224-239/4 (组播), 255.255.255.255 等
+is_unicast_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
+    local a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}" c="${BASH_REMATCH[3]}" d="${BASH_REMATCH[4]}"
+    for oct in "$a" "$b" "$c" "$d"; do
+        (( oct >= 0 && oct <= 255 )) || return 1
+    done
+    (( a == 0 )) && return 1            # 0.0.0.0/8
+    (( a == 127 )) && return 1           # loopback
+    (( a >= 224 && a <= 239 )) && return 1  # multicast 224.0.0.0/4
+    (( a == 255 && b == 255 && c == 255 && d == 255 )) && return 1  # broadcast
+    return 0
+}
+
+# --- 1. Ensure tunnel source IPv6 is on the physical interface ---
 if ! ip -6 addr show dev "$TUNNEL_DEV" | grep -q "$TUNNEL_SRC"; then
     log "source IPv6 missing from $TUNNEL_DEV, re-adding"
     ip -6 addr add "${TUNNEL_SRC}/128" dev "$TUNNEL_DEV" 2>/dev/null
     sleep 1
 fi
 
-# ─── 2. Ensure tunnel exists and is UP ───
+# --- 2. Ensure tunnel exists and is UP ---
 if ! ip link show "$TUNNEL_NAME" up 2>/dev/null | grep -q UP; then
     log "tunnel down, recreating"
     ip link del "$TUNNEL_NAME" 2>/dev/null
@@ -62,69 +113,227 @@ if ! ip link show "$TUNNEL_NAME" up 2>/dev/null | grep -q UP; then
     echo 0 > "${FAIL_COUNT_FILE}.tmp" && mv "${FAIL_COUNT_FILE}.tmp" "$FAIL_COUNT_FILE"
 fi
 
-# ─── 3. Ensure IPv4 address is on tunnel ───
+# --- 3. Ensure IPv4 address is on tunnel ---
 if ! ip addr show "$TUNNEL_NAME" 2>/dev/null | grep -q "$IPV4_ADDR"; then
     log "IPv4 missing from tunnel, re-adding"
     ip addr add "${IPV4_ADDR}/32" dev "$TUNNEL_NAME" 2>/dev/null
 fi
 
-# ─── 4. Tunnel health check (any target reachable = healthy) ───
+# --- 3a. Route model 归一化 (修 Critical: legacy metric-0 tun4 default) ---
+# 先确保 metric-200 的 tun4 default 存在, 再删 legacy 无-metric/metric-0 的 tun4 default.
+# 顺序: 先 add metric200 (保证有 default), 再 del 旧的 (不空窗, 因为 metric200 已在).
+normalize_tun4_default() {
+    # 加 metric-200 tun4 default (replace 幂等: 若已有同 metric 则替换, 若无则新增)
+    ip route replace default dev "$TUNNEL_NAME" metric "$TUN_METRIC" 2>/dev/null
+    # 删所有非 metric-200 的 tun4 default (v3 legacy 无-metric / 其他 metric 残留).
+    # 枚举而非精确字符串匹配, 避免输出尾随空格等导致漏删 (实测: ^...$ 锚定会失败).
+    # 先加 metric200 再删旧的, 保证不空窗.
+    local removed=0
+    while IFS= read -r line; do
+        # line 形如 "default dev tun4 scope link" (无 metric) 或 "default dev tun4 scope link metric 50"
+        # 跳过含本脚本 metric 的那条
+        if [[ "$line" != *"metric $TUN_METRIC"* ]]; then
+            # 提取该条目的 metric (若有) 用于精确 del
+            local m
+            m=$(echo "$line" | grep -oE 'metric [0-9]+' | awk '{print $2}')
+            if [[ -n "$m" ]]; then
+                ip route del default dev "$TUNNEL_NAME" metric "$m" 2>/dev/null && removed=$((removed+1))
+            else
+                # 无 metric (metric 0): del 时不带 metric
+                ip route del default dev "$TUNNEL_NAME" 2>/dev/null && removed=$((removed+1))
+            fi
+        fi
+    done < <(ip route show default 2>/dev/null | grep "dev $TUNNEL_NAME")
+    if (( removed > 0 )); then
+        log "route model: removed $removed legacy tun4 default route(s) (migrated to metric $TUN_METRIC)"
+    fi
+}
+normalize_tun4_default
+
+# --- 4. Tunnel health check (any target reachable = healthy) ---
+# 注意: 健康检查在 normalize_tun4_default 之后, 保证 ping -I tun4 有路由 (H4).
 health_ok=false
 for target in "${HEALTH_TARGETS[@]}"; do
-    if ping -I "$TUNNEL_NAME" -c 1 -W 3 "$target" >/dev/null 2>&1; then
+    if ping -I "$TUNNEL_NAME" -c 1 -W "$HEALTH_TO" "$target" >/dev/null 2>&1; then
         health_ok=true
         break
     fi
 done
 
+# --- 4a. Route helpers ---
+ensure_tun4_default() {
+    ip route replace default dev "$TUNNEL_NAME" metric "$TUN_METRIC" 2>/dev/null
+}
+
+# 解析 WAN2 网关: 多源 + token 化 + 单候选 + unicast 校验 (H6).
+# 返回 0 并 stdout 网关, 或返回 1.
+resolve_wan2_gw() {
+    local candidates=() gw src
+    # 源1: table 202.eth6 (UniFi 管理, 最新). -o 单行 + token 查 via.
+    while IFS= read -r gw; do
+        [[ -n "$gw" ]] && is_unicast_ipv4 "$gw" && candidates+=("$gw")
+    done < <(ip -4 -o route show table 202.eth6 default 2>/dev/null \
+             | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1)}}')
+    if [[ ${#candidates[@]} -eq 1 ]]; then printf '%s\n' "${candidates[0]}"; return 0; fi
+    # 源1 多候选或无: 不取 first, 降级到源2 (避免歧义)
+    candidates=()
+    # 源2: udhcpc lease 文件
+    local lease="/data/udapi-config/ubios-udapi-server/udhcpc-ip.eth6"
+    if [[ -f "$lease" ]]; then
+        while IFS= read -r gw; do
+            [[ -n "$gw" ]] && is_unicast_ipv4 "$gw" && candidates+=("$gw")
+        done < <(grep -oE 'router[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$lease" 2>/dev/null | awk '{print $2}')
+    fi
+    if [[ ${#candidates[@]} -eq 1 ]]; then printf '%s\n' "${candidates[0]}"; return 0; fi
+    # 源3: 硬编码 fallback (degraded, 必须经端到端验证)
+    gw="${WAN2_GW_FALLBACK:-}"
+    if [[ -n "$gw" ]] && is_unicast_ipv4 "$gw"; then
+        printf '%s\n' "$gw"; return 0
+    fi
+    return 1
+}
+
+# WAN2 pre-route 验证 (carrier + 网关可达, 不修改路由). 返回 0/1.
+verify_wan2_preroute() {
+    local gw="$1"
+    [[ "$(cat /sys/class/net/"$WAN2_DEV_CFG"/carrier 2>/dev/null)" == "1" ]] || return 1
+    ip link show "$WAN2_DEV_CFG" 2>/dev/null | grep -q 'state UP' || return 1
+    ping -I "$WAN2_DEV_CFG" -c 1 -W 2 "$gw" >/dev/null 2>&1 || return 1
+    return 0
+}
+
+# WAN2 post-install 验证: route get 出口是 eth6 + 公网经 eth6 可达. 返回 0/1.
+# 此时 WAN2 default 已装, tun4 default 仍在 (metric 200).
+verify_wan2_postinstall() {
+    egress_is "$WAN2_DEV_CFG" || return 1
+    local t
+    for t in 1.1.1.1 8.8.8.8; do
+        ping -I "$WAN2_DEV_CFG" -c 1 -W 2 "$t" >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+# post-install 验证: ip route get 实际出口是预期 dev (H1/C3).
+egress_is() {  # $1 = expected dev
+    local target="${HEALTH_TARGETS[0]}"
+    local got
+    got=$(ip route get "$target" 2>/dev/null | grep -oE 'dev [^ ]+' | awk '{print $2}' | head -1)
+    [[ "$got" == "$1" ]]
+}
+
+# 快照证据 (仅状态转换/错误时). 输出紧凑几行.
+snapshot_state() {
+    {
+        echo "  default: $(ip route show default 2>/dev/null | tr '\n' '|')"
+        echo "  table202.eth6: $(ip route show table 202.eth6 default 2>/dev/null | tr '\n' '|')"
+        echo "  route-get ${HEALTH_TARGETS[0]}: $(ip route get "${HEALTH_TARGETS[0]}" 2>/dev/null | tr '\n' ' ')"
+        echo "  tun4: $(ip -br link show "$TUNNEL_NAME" 2>/dev/null)"
+    } 2>/dev/null
+}
+
+# --- 4b. 状态机: 每轮按实际内核状态收敛 (C2) ---
+# 始终先保证 tun4 default (metric 200) 存在
+if ! ensure_tun4_default; then
+    log "ERROR: ensure_tun4_default failed (cannot install tun4 metric $TUN_METRIC)"
+    snapshot_state | while IFS= read -r ln; do log "$ln"; done
+    # 不退出: 继续尝试 failover 评估, 但记录异常
+fi
+
 if $health_ok; then
-    # ── Tunnel is HEALTHY ──
-    PREV_FAILS=$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0)
+    # -- Tunnel HEALTHY --
+    PREV_FAILS=$(read_uint "$FAIL_COUNT_FILE" 0)
     echo 0 > "${FAIL_COUNT_FILE}.tmp" && mv "${FAIL_COUNT_FILE}.tmp" "$FAIL_COUNT_FILE"
 
-    # Restore default route if it was removed during failover
-    if ! ip route show default | grep -q "$TUNNEL_NAME"; then
-        log "tunnel recovered, restoring default route via $TUNNEL_NAME"
-        # Remove WAN2 failover route from main table before restoring tun4
-        ip route del default via "$(ip route show default 2>/dev/null | awk '/via/{print $3}')" 2>/dev/null
-        ip route replace default dev "$TUNNEL_NAME"
-        # Remove IPv6 failover route (eth4 RA route at metric 512 takes over automatically)
-        if [[ "${IPV6_FAILOVER:-false}" == "true" ]]; then
-            ip -6 route del default metric 100 2>/dev/null && \
-                log "WAN2 failover: IPv6 deactivated, eth4 RA route restored"
-        fi
-        log "WAN2 failover: deactivated, $TUNNEL_NAME is primary again"
-    fi
+    # 恢复防抖 (H3): 连续健康计数
+    RECOVER_OK=$(read_uint "$RECOVER_OK_FILE" 0)
+    RECOVER_OK=$((RECOVER_OK + 1))
+    echo "$RECOVER_OK" > "${RECOVER_OK_FILE}.tmp" && mv "${RECOVER_OK_FILE}.tmp" "$RECOVER_OK_FILE"
 
-    [[ "$PREV_FAILS" -ge "$FAIL_THRESHOLD" ]] && log "tunnel recovered after $PREV_FAILS failures"
+    # 三态判定 (C2): 看实际路由出口
+    if egress_is "$WAN2_DEV_CFG"; then
+        # 状态1: 处于 failover (出口 eth6)
+        # dwell 检查 (H3): 用独立 timestamp 文件, 不依赖 marker
+        DWELL_OK=true
+        failover_ts=$(read_uint "$FAILOVER_TS_FILE" 0)
+        if [[ "$failover_ts" -gt 0 ]]; then
+            now_ts=${EPOCHSECONDS:-$(date +%s)}
+            if (( now_ts - failover_ts < FAILOVER_MIN_DWELL )); then
+                DWELL_OK=false
+            fi
+        fi
+        if [[ "$RECOVER_OK" -ge "$RECOVER_OK_TH" ]] && $DWELL_OK; then
+            log "tunnel recovered ($RECOVER_OK consecutive), restoring primary via $TUNNEL_NAME"
+            # 删 WAN2 failover default (精确: dev eth6 + metric W2_METRIC)
+            ip route del default dev "$WAN2_DEV_CFG" metric "$W2_METRIC" 2>/dev/null
+            del_rc=$?
+            if (( del_rc != 0 )); then
+                # 可能 via 形式, 尝试带 gw
+                wan2_gw_cur=$(ip route show default 2>/dev/null | grep "dev $WAN2_DEV_CFG" \
+                              | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1);exit}}')
+                [[ -n "$wan2_gw_cur" ]] && ip route del default via "$wan2_gw_cur" dev "$WAN2_DEV_CFG" metric "$W2_METRIC" 2>/dev/null
+            fi
+            # 验证恢复 (H1)
+            if egress_is "$TUNNEL_NAME"; then
+                rm -f "$FAILOVER_MARKER" "$FAILOVER_TS_FILE"
+                echo 0 > "${RECOVER_OK_FILE}.tmp" && mv "${RECOVER_OK_FILE}.tmp" "$RECOVER_OK_FILE"
+                log "WAN2 failover: deactivated, $TUNNEL_NAME is primary again"
+                [[ "$PREV_FAILS" -ge "$FAIL_THRESHOLD" ]] && log "tunnel recovered after $PREV_FAILS failures"
+            else
+                log "ERROR: recovery verification failed, egress not $TUNNEL_NAME"
+                snapshot_state | while IFS= read -r ln; do log "$ln"; done
+            fi
+        fi
+        # 防抖未达标: 静默
+    elif egress_is "$TUNNEL_NAME"; then
+        # 状态2: 正常 primary (出口 tun4). 清理可能残留的 failover 状态.
+        rm -f "$FAILOVER_MARKER" "$FAILOVER_TS_FILE"
+        echo 0 > "${RECOVER_OK_FILE}.tmp" && mv "${RECOVER_OK_FILE}.tmp" "$RECOVER_OK_FILE" 2>/dev/null
+    else
+        # 状态3: neither (异常, 出口既非 tun4 也非 eth6). 不清状态, 告警.
+        log "WARN: egress is neither $TUNNEL_NAME nor $WAN2_DEV_CFG (route model anomaly)"
+        snapshot_state | while IFS= read -r ln; do log "$ln"; done
+    fi
 else
-    # ── Tunnel is UNHEALTHY ──
-    FAILS=$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0)
+    # -- Tunnel UNHEALTHY --
+    FAILS=$(read_uint "$FAIL_COUNT_FILE" 0)
     FAILS=$((FAILS + 1))
     echo "$FAILS" > "${FAIL_COUNT_FILE}.tmp" && mv "${FAIL_COUNT_FILE}.tmp" "$FAIL_COUNT_FILE"
+    echo 0 > "${RECOVER_OK_FILE}.tmp" && mv "${RECOVER_OK_FILE}.tmp" "$RECOVER_OK_FILE" 2>/dev/null
 
-    if [[ $FAILS -ge $FAIL_THRESHOLD ]]; then
-        # Remove tun4 default route if present
-        ip route del default dev "$TUNNEL_NAME" 2>/dev/null
-
-        # Ensure WAN2 failover route exists (covers both fresh failover and
-        # the case where tun4 was rebuilt but unhealthy with no default route)
-        if ! ip route show default | grep -q "via"; then
-            WAN2_GW=$(ip route show table 202.eth6 default 2>/dev/null | awk '{print $3}')
-            WAN2_DEV=$(ip route show table 202.eth6 default 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev")print $(i+1)}')
-            if [[ -n "$WAN2_GW" && -n "$WAN2_DEV" ]]; then
-                ip route add default via "$WAN2_GW" dev "$WAN2_DEV" 2>/dev/null
-                log "WAN2 failover: activated default via $WAN2_GW dev $WAN2_DEV"
-                # IPv6 failover: add lower-metric default route via WAN2
-                if [[ "${IPV6_FAILOVER:-false}" == "true" ]]; then
-                    WAN2_GW6=$(ip -6 route show table 202.eth6 default 2>/dev/null | awk '{print $3}' | head -1)
-                    if [[ -n "$WAN2_GW6" ]]; then
-                        ip -6 route add default via "$WAN2_GW6" dev "$WAN2_DEV" metric 100 2>/dev/null
-                        log "WAN2 failover: IPv6 activated via $WAN2_GW6 dev $WAN2_DEV metric 100"
-                    fi
-                fi
+    if [[ $FAILS -ge "$FAIL_THRESHOLD" ]]; then
+        # 已 failover 了吗? 看实际路由出口 (C2: 不信任 marker)
+        if egress_is "$WAN2_DEV_CFG"; then
+            : # 已切到 WAN2 且实际生效, 已收敛 (每轮都查, 不跳过修复)
+        else
+            # 需要激活 failover. 先解析网关 (H6)
+            WAN2_GW=$(resolve_wan2_gw || true)
+            if [[ -z "${WAN2_GW:-}" ]]; then
+                log "WAN2 failover: ERROR - cannot resolve WAN2 gateway (no single valid candidate)"
+                snapshot_state | while IFS= read -r ln; do log "$ln"; done
+            elif ! verify_wan2_preroute "$WAN2_GW"; then
+                # C1/H2 pre-route: 验证失败 -> 不装 WAN2 route, tun4 default 仍在 (metric 200)
+                log "WAN2 failover: WAN2 preroute failed (gw=$WAN2_GW), staying on $TUNNEL_NAME"
+                snapshot_state | while IFS= read -r ln; do log "$ln"; done
             else
-                log "WAN2 failover: WARNING - no WAN2 gateway found in table 202.eth6"
+                # 事务化切换: 装 WAN2 default (metric 100 < tun4 200), tun4 保留
+                if ip route replace default via "$WAN2_GW" dev "$WAN2_DEV_CFG" metric "$W2_METRIC" 2>/dev/null; then
+                    # post-install 验证 (H1/C3/H2): route get + 公网 ping
+                    if verify_wan2_postinstall; then
+                        now_ts=${EPOCHSECONDS:-$(date +%s)}
+                        echo "$now_ts" > "$FAILOVER_TS_FILE.tmp" && mv "$FAILOVER_TS_FILE.tmp" "$FAILOVER_TS_FILE"
+                        echo "$now_ts" > "$FAILOVER_MARKER.tmp" && mv "$FAILOVER_MARKER.tmp" "$FAILOVER_MARKER"
+                        log "WAN2 failover: activated default via $WAN2_GW dev $WAN2_DEV_CFG metric $W2_METRIC (tun4 kept metric $TUN_METRIC)"
+                        snapshot_state | while IFS= read -r ln; do log "$ln"; done
+                    else
+                        # post-install 失败: 回滚 WAN2 route (只删 WAN2, 保留 tun4)
+                        log "ERROR: failover post-install verification failed, reverting WAN2 route"
+                        ip route del default via "$WAN2_GW" dev "$WAN2_DEV_CFG" metric "$W2_METRIC" 2>/dev/null
+                        snapshot_state | while IFS= read -r ln; do log "$ln"; done
+                    fi
+                else
+                    log "ERROR: ip route replace WAN2 default failed (gw=$WAN2_GW)"
+                    snapshot_state | while IFS= read -r ln; do log "$ln"; done
+                fi
             fi
         fi
     else
@@ -132,7 +341,7 @@ else
     fi
 fi
 
-# ─── 5. Firewall rules (idempotent) ───
+# --- 5. Firewall rules (idempotent) ---
 ipt_add() {
     iptables -w 10 "$@" 2>/dev/null
 }
@@ -146,7 +355,7 @@ ipt_add -t nat -C POSTROUTING -o "$TUNNEL_NAME" -j MASQUERADE || ipt_add -t nat 
 ipt_add -C INPUT -i "$TUNNEL_NAME" -m state --state RELATED,ESTABLISHED -j ACCEPT || iptables -w 10 -I INPUT -i "$TUNNEL_NAME" -m state --state RELATED,ESTABLISHED -j ACCEPT
 ipt_add -C INPUT -i "$TUNNEL_NAME" -j DROP || ipt_add -A INPUT -i "$TUNNEL_NAME" -j DROP
 
-# ─── 6. WAN status hack: route ip6tnl1 health checks through tunnel ───
+# --- 6. WAN status hack: route ip6tnl1 health checks through tunnel ---
 ip rule show | grep -q "from $DSLITE_SRC lookup main" || {
     ip rule add from "$DSLITE_SRC" lookup main prio 100
     log "WAN hack: added ip rule for $DSLITE_SRC"
@@ -156,7 +365,7 @@ ipt_add -t nat -C POSTROUTING -s "$DSLITE_SRC" -o "$TUNNEL_NAME" -j SNAT --to-so
     log "WAN hack: added SNAT rule for $DSLITE_SRC"
 }
 
-# ─── 7. Fix miniupnpd external interface (ubios generates wrong ext_ifname) ───
+# --- 7. Fix miniupnpd external interface (ubios generates wrong ext_ifname) ---
 UPNPD_CONF="/run/miniupnpd.conf"
 if [[ -f "$UPNPD_CONF" ]] && grep -q "^ext_ifname=ip6tnl1" "$UPNPD_CONF"; then
     log "miniupnpd: ext_ifname=ip6tnl1 detected, patching to $TUNNEL_NAME"
@@ -176,7 +385,7 @@ if [[ -f "$UPNPD_CONF" ]] && grep -q "^ext_ifname=ip6tnl1" "$UPNPD_CONF"; then
     fi
 fi
 
-# ─── 8. Port forwarding rules (from config, idempotent) ───
+# --- 8. Port forwarding rules (from config, idempotent) ---
 for rule in "${PORT_FORWARDS[@]}"; do
     IFS=: read -r proto ext_port dest_ip dest_port <<< "$rule"
     # DNAT (external -> internal)

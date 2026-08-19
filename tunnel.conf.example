@@ -23,6 +23,17 @@ DSLITE_SRC="192.0.0.2"               # DS-Lite B4 地址 (通常不需要改)
 HEALTH_TARGETS=("8.8.8.8" "1.1.1.1") # 任一可达即视为健康
 FAIL_COUNT_FILE="/tmp/tun4-fail-count"
 FAIL_THRESHOLD=3                      # 连续失败次数 (每15秒检查, 共45秒) 后启用 WAN2 failover
+HEALTH_TIMEOUT=3                      # 健康检查 ping 超时 (秒)
+
+# ─── WAN2 (备用 ISP, 如 Starlink) failover ───
+# metric 竞争模型: tun4(primary) metric 200, WAN2(failover) metric 100 (更低=优先)
+# 两条 default 共存, 切换靠增删 WAN2 那条; tun4 default 永不删除 (保证健康检查路由)
+WAN2_DEV="eth6"                       # WAN2 物理接口
+WAN2_GW_FALLBACK="10.0.0.1"           # table 202.eth6 / udhcpc lease 都取不到网关时的兜底
+TUNNEL_ROUTE_METRIC=200               # tun4 default 路由 metric
+WAN2_ROUTE_METRIC=100                 # WAN2 failover default 路由 metric (必须 < TUNNEL_ROUTE_METRIC)
+RECOVER_OK_THRESHOLD=3                # 恢复防抖: 连续 N 次健康才切回 tun4
+FAILOVER_MIN_DWELL_SEC=60             # failover 后至少停留 M 秒才允许恢复 (避免抖动)
 
 # ─── 日志 ───
 LOG="/var/log/tunnel-watchdog.log"
