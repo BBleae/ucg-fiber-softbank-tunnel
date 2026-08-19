@@ -35,6 +35,13 @@ WAN2_ROUTE_METRIC=100                 # WAN2 failover default 路由 metric (必
 RECOVER_OK_THRESHOLD=3                # 恢复防抖: 连续 N 次健康才切回 tun4
 FAILOVER_MIN_DWELL_SEC=60             # failover 后至少停留 M 秒才允许恢复 (避免抖动)
 
+# ─── eth4 IPv6 丢失保护 (UCG 5.1.19 hb46pp 崩溃缓解) ───
+# 背景: 固件 5.1.19 的 hb46pp(UniFi DS-Lite 客户端)在部分线路反复崩溃,
+#   耗尽 CPU 致控制面死机, 连带 eth4 IPv6 源地址周期性丢失. 本保护在
+#   eth4 IPv6 连续丢失达到阈值时重启 udapi-server 打断崩溃循环.
+ETH4_IPV6_MISS_THRESHOLD=4            # 连续丢失次数 (每15秒1次, 4=约60秒)
+UDAPI_RESTART_COOLDOWN_SEC=300        # 重启 udapi-server 冷却期 (秒), 防重启风暴
+
 # ─── 日志 ───
 LOG="/var/log/tunnel-watchdog.log"
 MAX_LOG_BYTES=1048576                 # 1MB, 超过则轮转

@@ -150,6 +150,53 @@ normalize_tun4_default() {
 }
 normalize_tun4_default
 
+# --- 3b. eth4 IPv6 丢失保护: 连续丢失触发 udapi-server 重启 ---
+# 背景 (2026-08-20): UCG-Fiber 5.1.19 的 hb46pp-eth4 (UniFi DS-Lite 客户端) 在
+#   SoftBank 线路上反复崩溃 -> udapi watchdog 反复重启 -> 崩溃循环耗尽 CPU
+#   (system time 66.7%, load 8) -> 控制面死机 (内网 ping 不通 192.168.1.1).
+#   连带 odhcp6c 被 suspend/resume -> eth4 IPv6 源地址周期性丢失 -> tun4 隧道失效.
+# 此保护: 检测到 eth4 的 TUNNEL_SRC IPv6 连续丢失 >= ETH4_IPV6_MISS_THRESHOLD 次
+#   时, 触发 `systemctl restart udapi-server` (UniFi 自己的 WAN 管理), 打断崩溃循环.
+#   带冷却期 (UDAPI_RESTART_COOLDOWN_SEC) 防重启风暴, 只记录日志不中断正常路径.
+ETH4_MISS_FILE="/tmp/tun4-eth4-miss-count"
+UDAPI_RESTART_TS_FILE="/tmp/tun4-udapi-restart-ts"
+ETH4_MISS_THRESHOLD="${ETH4_IPV6_MISS_THRESHOLD:-4}"
+UDAPI_RESTART_COOLDOWN="${UDAPI_RESTART_COOLDOWN_SEC:-300}"
+
+# 检测 eth4 IPv6 源地址当前是否缺失 (仅检测, 实际 re-add 由下方第 4 节健康检查兜底)
+eth4_src_missing=false
+if ! ip -6 addr show dev "$TUNNEL_DEV" 2>/dev/null | grep -q "$TUNNEL_SRC"; then
+    eth4_src_missing=true
+fi
+
+if $eth4_src_missing; then
+    # 缺失: 累计连续次数
+    ETH4_MISS=$(read_uint "$ETH4_MISS_FILE" 0)
+    ETH4_MISS=$((ETH4_MISS + 1))
+else
+    ETH4_MISS=0
+fi
+echo "$ETH4_MISS" > "${ETH4_MISS_FILE}.tmp" && mv "${ETH4_MISS_FILE}.tmp" "$ETH4_MISS_FILE"
+
+# 达到阈值且冷却期已过 -> 重启 udapi-server
+if $eth4_src_missing && [[ "$ETH4_MISS" -ge "$ETH4_MISS_THRESHOLD" ]]; then
+    last_restart=$(read_uint "$UDAPI_RESTART_TS_FILE" 0)
+    now_ts=${EPOCHSECONDS:-$(date +%s)}
+    if (( last_restart == 0 || now_ts - last_restart >= UDAPI_RESTART_COOLDOWN )); then
+        log "WARN: eth4 IPv6 missing $ETH4_MISS consecutive checks; restarting udapi-server (hb46pp crash-loop mitigation)"
+        # 内联快照 (snapshot_state 定义在后方, 此处不可用)
+        log "  eth4-ipv6: $(ip -6 addr show dev "$TUNNEL_DEV" 2>/dev/null | grep inet6 | tr '\n' '|' || echo none)"
+        # 重启 UniFi WAN 管理, 打断 hb46pp 崩溃循环. 用 timeout 防卡死.
+        if timeout 30 systemctl restart udapi-server 2>/dev/null; then
+            echo "$now_ts" > "${UDAPI_RESTART_TS_FILE}.tmp" && mv "${UDAPI_RESTART_TS_FILE}.tmp" "$UDAPI_RESTART_TS_FILE"
+            echo 0 > "${ETH4_MISS_FILE}.tmp" && mv "${ETH4_MISS_FILE}.tmp" "$ETH4_MISS_FILE"
+            log "udapi-server restarted (cooldown ${UDAPI_RESTART_COOLDOWN}s), IPv6 re-sync expected"
+        else
+            log "ERROR: udapi-server restart failed or timed out"
+        fi
+    fi
+fi
+
 # --- 4. Tunnel health check (any target reachable = healthy) ---
 # 注意: 健康检查在 normalize_tun4_default 之后, 保证 ping -I tun4 有路由 (H4).
 health_ok=false
