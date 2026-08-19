@@ -197,6 +197,34 @@ if $eth4_src_missing && [[ "$ETH4_MISS" -ge "$ETH4_MISS_THRESHOLD" ]]; then
     fi
 fi
 
+# --- 3c. 确保 eth4 IPv6 RA 默认路由在 main 表 (static 模式修复) ---
+# 背景 (2026-08-20): wan_type 从 dslite 改为 static 后, UniFi 把 eth4 的 IPv6 RA
+#   默认路由放入 table 201.eth4 (策略路由表), main 表不再有 IPv6 默认路由.
+#   -> LAN IPv6 出网断 (实测 ping6 100% loss). 也从 201.eth4 复制到 main 表后恢复 (0% loss).
+# 每轮幂等: 若 main 表无 eth4 IPv6 默认, 且 201.eth4 表有, 则复制.
+ensure_eth4_ipv6_default() {
+    local ra_route
+    # 已在 main 表: 正常, 直接返回 (每轮幂等, 静默)
+    if ip -6 route show table main 2>/dev/null | grep -q "default.*dev $TUNNEL_DEV"; then
+        return 0
+    fi
+    ra_route=$(ip -6 route show table 201.eth4 default 2>/dev/null | grep "via" | head -1)
+    if [[ -n "$ra_route" ]]; then
+        # 去掉 "table 201.eth4" 字样, 只保留 route 部分加到 main 表
+        local clean
+        clean=$(echo "$ra_route" | sed 's/ table 201\.eth4//')
+        if ip -6 route add $clean 2>/dev/null; then
+            # 防抖: 只有状态从"缺失"变成"已恢复"才记录, 避免 UniFi 周期性清表导致每15s刷日志
+            local st_file="/tmp/tun4-eth4-ipv6-default-ok"
+            if [[ ! -f "$st_file" ]]; then
+                log "ipv6: copied eth4 RA default route to main table (LAN IPv6 out restored)"
+                touch "$st_file"
+            fi
+        fi
+    fi
+}
+ensure_eth4_ipv6_default
+
 # --- 4. Tunnel health check (any target reachable = healthy) ---
 # 注意: 健康检查在 normalize_tun4_default 之后, 保证 ping -I tun4 有路由 (H4).
 health_ok=false

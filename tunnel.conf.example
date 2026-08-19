@@ -42,6 +42,11 @@ FAILOVER_MIN_DWELL_SEC=60             # failover 后至少停留 M 秒才允许�
 ETH4_IPV6_MISS_THRESHOLD=4            # 连续丢失次数 (每15秒1次, 4=约60秒)
 UDAPI_RESTART_COOLDOWN_SEC=300        # 重启 udapi-server 冷却期 (秒), 防重启风暴
 
+# ─── eth4 IPv6 出网修复 (wan_type=static 时) ───
+# 背景: wan_type 从 dslite 改 static 后, UniFi 把 eth4 的 IPv6 RA 默认路由
+#   移入 table 201.eth4 策略路由表, main 表无 IPv6 默认 -> LAN IPv6 出网断.
+#   本脚本每轮从 201.eth4 复制 RA 路由到 main 表, 恢复 LAN IPv6 出网.
+
 # ─── 日志 ───
 LOG="/var/log/tunnel-watchdog.log"
 MAX_LOG_BYTES=1048576                 # 1MB, 超过则轮转
