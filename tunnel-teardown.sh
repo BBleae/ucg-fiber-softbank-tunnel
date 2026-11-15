@@ -36,16 +36,34 @@ iptables -w 10 -t mangle -D FORWARD -o "$TUNNEL_NAME" -p tcp --tcp-flags SYN,RST
 iptables -w 10 -t nat -D POSTROUTING -o "$TUNNEL_NAME" -j MASQUERADE 2>/dev/null || true
 
 # Port forward rules (from config)
+# 与 watchdog 的 parse_forward 保持一致: "起-止" 范围原样映射, DNAT 不带端口
+parse_forward() {
+    local ext_port dest_port
+    IFS=: read -r proto ext_port dest_ip dest_port <<< "$1"
+    ext_match="${ext_port/-/:}"
+    dest_match="${dest_port/-/:}"
+    if [[ "$ext_port" == *-* || "$dest_port" == *-* ]]; then
+        [[ "$ext_port" == "$dest_port" && "$ext_port" =~ ^([0-9]+)-([0-9]+)$ ]] || return 1
+        (( 10#${BASH_REMATCH[1]} <= 10#${BASH_REMATCH[2]} && 10#${BASH_REMATCH[2]} <= 65535 )) || return 1
+        dnat_to="$dest_ip"
+    else
+        dnat_to="${dest_ip}:${dest_port}"
+    fi
+}
+
 for rule in "${PORT_FORWARDS[@]}"; do
-    IFS=: read -r proto ext_port dest_ip dest_port <<< "$rule"
+    if ! parse_forward "$rule"; then
+        log "WARNING: invalid port forward rule '$rule', skipped"
+        continue
+    fi
     # DNAT (external)
-    iptables -w 10 -t nat -D PREROUTING -i "$TUNNEL_NAME" -p "$proto" --dport "$ext_port" -j DNAT --to-destination "${dest_ip}:${dest_port}" 2>/dev/null || true
+    iptables -w 10 -t nat -D PREROUTING -i "$TUNNEL_NAME" -p "$proto" --dport "$ext_match" -j DNAT --to-destination "$dnat_to" 2>/dev/null || true
     # Hairpin DNAT
-    iptables -w 10 -t nat -D PREROUTING -i br0 -p "$proto" --dport "$ext_port" -d "$IPV4_ADDR" -j DNAT --to-destination "${dest_ip}:${dest_port}" 2>/dev/null || true
+    iptables -w 10 -t nat -D PREROUTING -i br0 -p "$proto" --dport "$ext_match" -d "$IPV4_ADDR" -j DNAT --to-destination "$dnat_to" 2>/dev/null || true
     # Hairpin MASQUERADE
-    iptables -w 10 -t nat -D POSTROUTING -s "$LAN_SUBNET" -d "$dest_ip" -p "$proto" --dport "$dest_port" -j MASQUERADE 2>/dev/null || true
+    iptables -w 10 -t nat -D POSTROUTING -s "$LAN_SUBNET" -d "$dest_ip" -p "$proto" --dport "$dest_match" -j MASQUERADE 2>/dev/null || true
     # FORWARD allow
-    iptables -w 10 -D FORWARD -i "$TUNNEL_NAME" -o br0 -p "$proto" --dport "$dest_port" -d "$dest_ip" -m state --state NEW -j ACCEPT 2>/dev/null || true
+    iptables -w 10 -D FORWARD -i "$TUNNEL_NAME" -o br0 -p "$proto" --dport "$dest_match" -d "$dest_ip" -m state --state NEW -j ACCEPT 2>/dev/null || true
 done
 
 # FORWARD core rules
@@ -75,6 +93,7 @@ ip -6 tunnel del "$TUNNEL_NAME" 2>/dev/null || true
 
 log "Removing tunnel source IPv6 from $TUNNEL_DEV..."
 ip -6 addr del "${TUNNEL_SRC}/128" dev "$TUNNEL_DEV" 2>/dev/null || true
+ip -6 addr del "${TUNNEL_SRC}/128" dev lo 2>/dev/null || true
 
 # ─── 6. 清理状态文件 ───
 rm -f "$FAIL_COUNT_FILE" "${FAIL_COUNT_FILE}.tmp"

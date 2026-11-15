@@ -79,7 +79,19 @@ is_unicast_ipv4() {
     return 0
 }
 
-# --- 1. Ensure tunnel source IPv6 is on the physical interface ---
+# --- 1. Keep the tunnel source IPv6 on lo across UniFi WAN reprovisioning ---
+# UniFi OS 6.0.17 may remove the static address from eth4 on each DHCPv4 leasefail.
+# The ipip6 tunnel stays usable when its local IPv6 also exists on lo.
+if ! ip -6 addr show dev lo to "${TUNNEL_SRC}/128" | grep -q 'inet6'; then
+    if ip -6 addr add "${TUNNEL_SRC}/128" dev lo 2>/dev/null; then
+        log "tunnel source IPv6 pinned on lo"
+    elif ! ip -6 addr show dev lo to "${TUNNEL_SRC}/128" | grep -q 'inet6'; then
+        log "ERROR: failed to pin tunnel source IPv6 on lo"
+        exit 1
+    fi
+fi
+
+# Keep eth4 configured as before; UniFi can still remove and restore this copy.
 if ! ip -6 addr show dev "$TUNNEL_DEV" | grep -q "$TUNNEL_SRC"; then
     log "source IPv6 missing from $TUNNEL_DEV, re-adding"
     ip -6 addr add "${TUNNEL_SRC}/128" dev "$TUNNEL_DEV" 2>/dev/null
@@ -461,17 +473,40 @@ if [[ -f "$UPNPD_CONF" ]] && grep -q "^ext_ifname=ip6tnl1" "$UPNPD_CONF"; then
 fi
 
 # --- 8. Port forwarding rules (from config, idempotent) ---
+# 端口可写 "起-止" 范围: 内外网范围必须相同, DNAT 不带端口 => 内核不改端口, 原样映射
+# 设置全局 proto dest_ip ext_match dest_match dnat_to; 规则无效返回 1
+parse_forward() {
+    local ext_port dest_port
+    IFS=: read -r proto ext_port dest_ip dest_port <<< "$1"
+    ext_match="${ext_port/-/:}"
+    dest_match="${dest_port/-/:}"
+    if [[ "$ext_port" == *-* || "$dest_port" == *-* ]]; then
+        [[ "$ext_port" == "$dest_port" && "$ext_port" =~ ^([0-9]+)-([0-9]+)$ ]] || return 1
+        (( 10#${BASH_REMATCH[1]} <= 10#${BASH_REMATCH[2]} && 10#${BASH_REMATCH[2]} <= 65535 )) || return 1
+        dnat_to="$dest_ip"
+    else
+        dnat_to="${dest_ip}:${dest_port}"
+    fi
+}
+
+PF_WARNED="/tmp/tun4-pf-invalid-warned"   # 防抖: 每条无效规则每次开机只记一次
 for rule in "${PORT_FORWARDS[@]}"; do
-    IFS=: read -r proto ext_port dest_ip dest_port <<< "$rule"
+    if ! parse_forward "$rule"; then
+        if ! grep -qxF -- "$rule" "$PF_WARNED" 2>/dev/null; then
+            log "port forward: invalid rule '$rule' (range must be lo-hi, identical on both sides), skipped"
+            echo "$rule" >> "$PF_WARNED"
+        fi
+        continue
+    fi
     # DNAT (external -> internal)
-    ipt_add -t nat -C PREROUTING -i "$TUNNEL_NAME" -p "$proto" --dport "$ext_port" -j DNAT --to-destination "${dest_ip}:${dest_port}" || \
-        ipt_add -t nat -A PREROUTING -i "$TUNNEL_NAME" -p "$proto" --dport "$ext_port" -j DNAT --to-destination "${dest_ip}:${dest_port}"
+    ipt_add -t nat -C PREROUTING -i "$TUNNEL_NAME" -p "$proto" --dport "$ext_match" -j DNAT --to-destination "$dnat_to" || \
+        ipt_add -t nat -A PREROUTING -i "$TUNNEL_NAME" -p "$proto" --dport "$ext_match" -j DNAT --to-destination "$dnat_to"
     # FORWARD allow for new connections
-    ipt_add -C FORWARD -i "$TUNNEL_NAME" -o br0 -p "$proto" --dport "$dest_port" -d "$dest_ip" -m state --state NEW -j ACCEPT || \
-        ipt_add -A FORWARD -i "$TUNNEL_NAME" -o br0 -p "$proto" --dport "$dest_port" -d "$dest_ip" -m state --state NEW -j ACCEPT
+    ipt_add -C FORWARD -i "$TUNNEL_NAME" -o br0 -p "$proto" --dport "$dest_match" -d "$dest_ip" -m state --state NEW -j ACCEPT || \
+        ipt_add -A FORWARD -i "$TUNNEL_NAME" -o br0 -p "$proto" --dport "$dest_match" -d "$dest_ip" -m state --state NEW -j ACCEPT
     # Hairpin NAT: LAN access via public IP
-    ipt_add -t nat -C PREROUTING -i br0 -p "$proto" --dport "$ext_port" -d "$IPV4_ADDR" -j DNAT --to-destination "${dest_ip}:${dest_port}" || \
-        ipt_add -t nat -A PREROUTING -i br0 -p "$proto" --dport "$ext_port" -d "$IPV4_ADDR" -j DNAT --to-destination "${dest_ip}:${dest_port}"
-    ipt_add -t nat -C POSTROUTING -s "$LAN_SUBNET" -d "$dest_ip" -p "$proto" --dport "$dest_port" -j MASQUERADE || \
-        ipt_add -t nat -A POSTROUTING -s "$LAN_SUBNET" -d "$dest_ip" -p "$proto" --dport "$dest_port" -j MASQUERADE
+    ipt_add -t nat -C PREROUTING -i br0 -p "$proto" --dport "$ext_match" -d "$IPV4_ADDR" -j DNAT --to-destination "$dnat_to" || \
+        ipt_add -t nat -A PREROUTING -i br0 -p "$proto" --dport "$ext_match" -d "$IPV4_ADDR" -j DNAT --to-destination "$dnat_to"
+    ipt_add -t nat -C POSTROUTING -s "$LAN_SUBNET" -d "$dest_ip" -p "$proto" --dport "$dest_match" -j MASQUERADE || \
+        ipt_add -t nat -A POSTROUTING -s "$LAN_SUBNET" -d "$dest_ip" -p "$proto" --dport "$dest_match" -j MASQUERADE
 done

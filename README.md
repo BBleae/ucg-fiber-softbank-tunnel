@@ -23,7 +23,7 @@ SoftBank 10G 光纤 + UCG-Fiber 路由器上的 IPIP6 隧道完整配置方案�
 | `tunnel-watchdog.service` | `/data/` + `/etc/systemd/system/` | watchdog systemd 服务 |
 | `tunnel-watchdog.timer` | `/data/` + `/etc/systemd/system/` | watchdog 15秒定时器 |
 | `wan-hook.conf` | `/data/` + `/etc/systemd/system/udapi-server.service.d/` | 注入 LD_PRELOAD 到 udapi-server |
-| `10-tunnel-setup.sh` | `/data/on_boot.d/` | 固件更新后自动恢复配置 |
+| `10-tunnel-setup.sh` | `/data/on_boot.d/` | 有 `udm-boot.service` 时在开机恢复配置 |
 | `deploy.sh` | (本地) | 一键部署脚本 |
 
 ## 配置文件
@@ -52,6 +52,7 @@ PORT_FORWARDS=(
 - 自动创建/恢复 IPv4-in-IPv6 隧道 (tun4)
 - 防火墙规则: MASQUERADE, FORWARD, MSS clamping, INPUT 保护
 - UniFi reprovisioning 后自动恢复
+- 将隧道源 IPv6 同时保留在 `lo`，避免 eth4 被 WAN 管理进程清理地址时中断 tun4
 - 单实例锁 (flock) 防止并发执行
 - 隧道创建失败时正确报错退出 (不会误报成功)
 - 日志自动轮转 (超过 1MB 归档)
@@ -74,10 +75,11 @@ PORT_FORWARDS=(
 - 方案: LD_PRELOAD hook 拦截 `setsockopt(SO_BINDTODEVICE)`, 当设备名为 `ip6tnl1` 时替换为 `tun4`
 - 效果: 健康检查走 tun4, WAN 显示 UP, tun4 挂了则正确显示 DOWN
 
-### 5. 固件更新自动恢复
-- Systemd 单元和 wan-hook.conf 同时备份到 `/data/` (固件更新不会清除)
-- `/data/on_boot.d/10-tunnel-setup.sh` 在每次启动时自动恢复配置
-- 无需手动干预
+### 5. 启动恢复
+- 已启用的 `tunnel-watchdog.timer` 在普通重启后恢复隧道并将源 IPv6 加到 `lo`
+- Systemd 单元和 wan-hook.conf 同时备份到 `/data/`
+- `/data/on_boot.d/10-tunnel-setup.sh` 只有安装并启用 `udm-boot.service` 等执行器后才会运行；该脚本会先恢复单元，再将源地址加到 `lo`
+- 当前 UCG-Fiber 的 UniFi OS 6.0.17 没有 `udm-boot.service`，下一次固件更新后须确认 timer 和 WAN hook 仍在运行
 
 ## 一键部署
 
@@ -104,7 +106,7 @@ ssh ucg 'mkdir -p /etc/systemd/system/udapi-server.service.d'
 ssh ucg 'cp /data/wan-hook.conf /etc/systemd/system/udapi-server.service.d/'
 ssh ucg 'systemctl daemon-reload && systemctl restart udapi-server'
 
-# 4. 安装 on_boot.d 自动恢复
+# 4. 放置可选的 on_boot.d 恢复脚本（需另有执行器）
 scp 10-tunnel-setup.sh ucg:/data/
 ssh ucg 'mkdir -p /data/on_boot.d && cp /data/10-tunnel-setup.sh /data/on_boot.d/ && chmod +x /data/on_boot.d/10-tunnel-setup.sh'
 
@@ -147,14 +149,19 @@ PORT_FORWARDS=(
     "tcp:25565:192.168.1.200:25565"
     "tcp:8080:192.168.1.150:8080"    # 新增: HTTP 服务
     "udp:51820:192.168.1.150:51820"  # 新增: WireGuard
+    "tcp:47000-49000:192.168.1.150:47000-49000"  # 新增: 端口范围
+    "udp:47000-49000:192.168.1.150:47000-49000"
 )
 ```
+
+端口范围写成 `起-止` (含两端)，内外网范围必须相同，按原端口一一映射 (DNAT 不指定端口，内核不改写端口)。范围格式错误 (非 `起-止`、起 > 止、超过 65535) 或两侧不一致的规则会被跳过，每条每次开机只记一次日志。
 
 修改后重新部署 (`./deploy.sh ucg`) 或直接 `scp tunnel.conf ucg:/data/`，watchdog 下次运行时会自动应用新规则。
 
 ## 注意事项
 
-- **固件更新**: `/data/on_boot.d/10-tunnel-setup.sh` 会自动恢复 systemd 配置。如果 `on_boot.d` 机制不工作，手动运行 `./deploy.sh ucg` 即可
+- **UniFi OS 6.0.17 的 eth4 地址抖动**: 实测 DHCPv4 `leasefail` 约每 30 秒伴随 eth4 上的静态隧道源 IPv6 被删除；`lo` 上保留同一个 `/128` 后，eth4 再次删址时 tun4 仍可通。部署后需从内网设备连续测试至少 5 分钟，并重启验证。运行 `tunnel-teardown.sh` 会移除 `lo` 上的地址。
+- **固件更新**: 更新后检查 `tunnel-watchdog.timer`、`udapi-server` 的 WAN hook 和 `lo` 上的源地址；缺失时运行 `./deploy.sh ucg` 恢复
 - **MTU**: 隧道 MTU 1460, 内网设备保持默认 1500 即可, MSS clamping 自动处理
 - **DNS**: 路由器使用 127.0.0.1:53 (dnsmasq), 不受隧道影响
 - **IPv6**: 内网 IPv6 通过 eth4 原生 IPoE, 不走隧道
