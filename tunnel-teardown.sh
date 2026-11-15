@@ -74,6 +74,14 @@ iptables -w 10 -D FORWARD -i "$TUNNEL_NAME" -o br0 -m state --state ESTABLISHED,
 iptables -w 10 -D INPUT -i "$TUNNEL_NAME" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 iptables -w 10 -D INPUT -i "$TUNNEL_NAME" -j DROP 2>/dev/null || true
 
+# 隧道外层包的 mangle OUTPUT 放行 (watchdog 第 2a 节): 按编号删掉所有带 tag 的规则
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    n=$(ip6tables -w 10 -t mangle -S OUTPUT 2>/dev/null \
+        | awk 'NR > 1 && index($0, "tun4-outer-bypass") { print NR - 1; exit }' || true)
+    [[ -n "$n" ]] || break
+    ip6tables -w 10 -t mangle -D OUTPUT "$n" 2>/dev/null || break
+done
+
 log "All custom iptables rules removed."
 
 # ─── 4. WAN hack + failover 规则清理 ───

@@ -53,6 +53,7 @@ PORT_FORWARDS=(
 - 防火墙规则: MASQUERADE, FORWARD, MSS clamping, INPUT 保护
 - UniFi reprovisioning 后自动恢复
 - 将隧道源 IPv6 同时保留在 `lo`，避免 eth4 被 WAN 管理进程清理地址时中断 tun4
+- 隧道外层包固定走 eth4：tun4 的 fwmark 设为 UniFi 的 WAN1 路由 mark（从 `ip -6 rule` 动态读取），并在 ip6tables mangle OUTPUT 第 1 条放行外层包，避开 UniFi 的 mark 链
 - 单实例锁 (flock) 防止并发执行
 - 隧道创建失败时正确报错退出 (不会误报成功)
 - 日志自动轮转 (超过 1MB 归档)
@@ -161,7 +162,8 @@ PORT_FORWARDS=(
 ## 注意事项
 
 - **UniFi OS 6.0.17 的 eth4 地址抖动**: 实测 DHCPv4 `leasefail` 约每 30 秒伴随 eth4 上的静态隧道源 IPv6 被删除；`lo` 上保留同一个 `/128` 后，eth4 再次删址时 tun4 仍可通。部署后需从内网设备连续测试至少 5 分钟，并重启验证。运行 `tunnel-teardown.sh` 会移除 `lo` 上的地址。
-- **固件更新**: 更新后检查 `tunnel-watchdog.timer`、`udapi-server` 的 WAN hook 和 `lo` 上的源地址；缺失时运行 `./deploy.sh ucg` 恢复
+- **UniFi OS 6.0.17 的隧道外层路由**: UniFi 把 eth6 当作唯一的 IPv6 出口，mangle OUTPUT 会给外层包打上 eth6 mark（`0x21960000`）并据此重新查路由。外层包之所以还能走 eth4，只是因为 main 表里有 watchdog 复制进去的 eth4 IPv6 默认。udapi 每次 DHCPv6 更新（约每 2.85 分钟）都会删掉这条（`Removing unknown route ::/0`），在 watchdog 下一轮补回之前，外层包从 Starlink 发出被丢，每次断 0–15 秒。修复由两部分组成：tun4 设 WAN1 fwmark，让隧道自身查路由时命中 `fwmark ... lookup 201.eth4`；mangle OUTPUT 第 1 条放行外层包（comment `tun4-outer-bypass`），使其 mark 不被改写、不会触发重路由。自建 rule/table 会被 udapi 对账删除，不能用。检查命令: `ip -d link show tun4 | grep fwmark`、`ip6tables -t mangle -S OUTPUT | sed -n 2p`
+- **固件更新**: 更新后检查 `tunnel-watchdog.timer`、`udapi-server` 的 WAN hook、`lo` 上的源地址和 tun4 的 fwmark；缺失时运行 `./deploy.sh ucg` 恢复
 - **MTU**: 隧道 MTU 1460, 内网设备保持默认 1500 即可, MSS clamping 自动处理
 - **DNS**: 路由器使用 127.0.0.1:53 (dnsmasq), 不受隧道影响
 - **IPv6**: 内网 IPv6 通过 eth4 原生 IPoE, 不走隧道

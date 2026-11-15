@@ -1,6 +1,9 @@
 #!/bin/bash
-# Tunnel watchdog v4.1 - IPIP6 tunnel + WAN status hack + metric-competition failover
+# Tunnel watchdog v4.2 - IPIP6 tunnel + WAN status hack + metric-competition failover
 # Runs every 15 seconds via systemd timer
+#
+# v4.2 (2026-11-15): 隧道外层包固定走 eth4, 不再依赖 main 表的 IPv6 默认和
+#   TUNNEL_SRC 源地址规则 (tun4 fwmark + mangle OUTPUT 放行, 见第 2a 节)
 #
 # v4.1 (2026-08-19): 修复 v4 实现审查发现的 bug:
 #   - metric 归一化: 启动时显式迁移 legacy metric-0 tun4 default -> metric 200 (先加后删, 不空窗)
@@ -124,6 +127,113 @@ if ! ip link show "$TUNNEL_NAME" up 2>/dev/null | grep -q UP; then
     log "tunnel recreated by watchdog"
     echo 0 > "${FAIL_COUNT_FILE}.tmp" && mv "${FAIL_COUNT_FILE}.tmp" "$FAIL_COUNT_FILE"
 fi
+
+# --- 2a. 隧道外层路由钉在 WAN1 (eth4) ---
+# 背景 (2026-11-15, UniFi OS 6.0.17, 实测):
+#   UniFi 把 eth6 当作唯一的 IPv6 出口: mangle OUTPUT 的 UBIOS_WF_* 给本机新建的 IPv6
+#   连接打 eth6 mark (0x21960000) 并存进 connmark. 隧道外层 conntrack 的 mark 也是它,
+#   每个外层包都被 restore 成 eth6 mark, mark 一变就触发 ip6_route_me_harder 重查路由.
+#   外层包能走 eth4, 只是因为 main (规则 32000) 排在 mark 规则前, 且 main 里有 3c 复制的
+#   eth4 IPv6 默认. 但是:
+#   - DHCPv6 更新 (约每 2.85 分钟) 时 udapi 删掉 main 里这条 ("Removing unknown route ::/0");
+#   - DHCPv4 leasefail (约每 30s) 时 udapi 删掉 eth4 上的 TUNNEL_SRC 和
+#     "from TUNNEL_SRC lookup 201.eth4".
+#   main 默认缺失期间, 外层包被 mark 重路由, 或隧道自身查路由落到 "from all lookup 202.eth6",
+#   从 Starlink 发出后被丢 (抓包: 4.5s 内有 19230 个外层包走 eth6). 直到 watchdog 下一轮
+#   把默认补回 main 才恢复, 每次断 0-15s.
+# 修复 (两处缺一不可):
+#   1) tun4 fwmark 设为规则 "from all fwmark M/MASK lookup <N>.eth4" 里的 M. main 缺默认时,
+#      隧道自身查路由命中这条规则进 201.eth4. 该规则按 WAN 接口生成, 不随地址或 DHCP 变化.
+#      fwmark 只用于查路由, 不写 skb->mark.
+#      注意: 5.4 内核对 ipip6 仍按 CPU 缓存路由 (dst_cache), fwmark 不会关掉缓存.
+#      所用路由被删时缓存失效, 重查时带 mark. 若 201.eth4 的默认本身也缺失, 仍会落到 eth6
+#      并被缓存, 直到下一次地址变化清掉缓存 (与修复前相同).
+#   2) mangle OUTPUT 第 1 条: 外层包 (SRC->DST, proto 4) 直接 ACCEPT, 不进 UniFi 的 mark 链.
+#      mark 不变就不会重路由, 出口由 1) 决定.
+#   自建 rule/table 不可行: udapi 下一次对账就会删掉不认识的 rule 和路由 (实测).
+TUN_FWMARK_WARN_FILE="/tmp/tun4-fwmark-no-rule-warned"
+TUN_FWMARK_ERR_FILE="/tmp/tun4-fwmark-set-error"
+OUTER_BYPASS_TAG="tun4-outer-bypass"
+OUTER_BYPASS_ERR_FILE="/tmp/tun4-outer-bypass-error"
+
+# 在 ip -6 rule 中找 "from all fwmark M[/MASK] lookup <数字>.<TUNNEL_DEV> [proto X]", 输出 M.
+# 不满足时返回 1: 规则不存在, (M & MASK) != M, 或带这个 mark 查 TUNNEL_DST 时出口不是 TUNNEL_DEV
+# (比如更前面的规则截走了这个 mark).
+wan1_route_mark() {
+    local m
+    m=$(ip -6 rule show 2>/dev/null | awk -v dev="$TUNNEL_DEV" '
+        (NF == 7 || (NF == 9 && $8 == "proto")) &&
+        $2 == "from" && $3 == "all" && $4 == "fwmark" && $6 == "lookup" {
+            t = $7; n = index(t, ".")
+            if (n > 1 && substr(t, n + 1) == dev && substr(t, 1, n - 1) ~ /^[0-9]+$/) { print $5; exit }
+        }')
+    # 形如 0x21940000/0x3ffe0000 (省略 mask 时内核按全 1 匹配)
+    [[ "$m" =~ ^(0x[0-9a-fA-F]{1,8})(/(0x[0-9a-fA-F]{1,8}))?$ ]] || return 1
+    local val="${BASH_REMATCH[1]}" mask="${BASH_REMATCH[3]:-0xffffffff}"
+    (( val != 0 && (val & mask) == val )) || return 1
+    ip -6 route get "$TUNNEL_DST" from "$TUNNEL_SRC" mark "$val" 2>/dev/null | grep -q " dev $TUNNEL_DEV " || return 1
+    printf '%s\n' "$val"
+}
+
+ensure_tunnel_fwmark() {
+    local want cur
+    if ! want=$(wan1_route_mark); then
+        # 找不到可用的 mark 时保持现状: 旧 mark 若匹配不到任何规则, 效果与 mark 0 相同.
+        # 不清零, 免得 udapi 重建规则的瞬间让 fwmark 来回抖动.
+        if [[ ! -f "$TUN_FWMARK_WARN_FILE" ]]; then
+            log "WARN: no usable $TUNNEL_DEV fwmark rule; $TUNNEL_NAME fwmark left unchanged"
+            touch "$TUN_FWMARK_WARN_FILE"
+        fi
+        return 0
+    fi
+    rm -f "$TUN_FWMARK_WARN_FILE"
+    # ip -d link 只在 fwmark 非 0 时打印 "fwmark 0x..."
+    cur=$(ip -d link show "$TUNNEL_NAME" 2>/dev/null | grep -oE 'fwmark 0x[0-9a-fA-F]+' | awk '{print $2}')
+    (( ${cur:-0} == want )) && return 0
+    if ip link set dev "$TUNNEL_NAME" type ip6tnl fwmark "$want" 2>/dev/null; then
+        # changelink 会用不带 fwmark 的查路由结果重算 MTU (ip6_tnl_link_config), 改完重设
+        ip link set dev "$TUNNEL_NAME" mtu "$MTU" 2>/dev/null
+        rm -f "$TUN_FWMARK_ERR_FILE"
+        log "tunnel: outer route pinned to $TUNNEL_DEV via fwmark $want (was ${cur:-0})"
+    elif [[ ! -f "$TUN_FWMARK_ERR_FILE" ]]; then
+        log "ERROR: failed to set $TUNNEL_NAME fwmark $want"
+        touch "$TUN_FWMARK_ERR_FILE"
+    fi
+}
+
+# mangle OUTPUT 中第一条带 OUTER_BYPASS_TAG 的规则编号 (-S 第 1 行是策略, 第 k 行是第 k-1 条)
+outer_bypass_rulenum() {
+    ip6tables -w 10 -t mangle -S OUTPUT 2>/dev/null \
+        | awk -v tag="$OUTER_BYPASS_TAG" 'NR > 1 && index($0, tag) { print NR - 1; exit }'
+}
+
+ensure_outer_mangle_bypass() {
+    local spec=(-s "${TUNNEL_SRC}/128" -d "${TUNNEL_DST}/128" -p 4
+                -m comment --comment "$OUTER_BYPASS_TAG" -j ACCEPT)
+    # 合格: 带 tag 的规则只有一条, 排第 1 (在 UniFi 的 UBIOS_OUTPUT_JUMP 前), 且与当前 SRC/DST 完全一致
+    if [[ "$(ip6tables -w 10 -t mangle -S OUTPUT 2>/dev/null | grep -c -- "$OUTER_BYPASS_TAG")" == 1 ]] \
+       && [[ "$(outer_bypass_rulenum)" == 1 ]] \
+       && ip6tables -w 10 -t mangle -C OUTPUT "${spec[@]}" 2>/dev/null; then
+        return 0
+    fi
+    # 否则按编号删掉所有带 tag 的规则 (包括 SRC/DST 变更前的旧规则), 再插到第 1 条
+    local i n
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        n=$(outer_bypass_rulenum)
+        [[ -n "$n" ]] || break
+        ip6tables -w 10 -t mangle -D OUTPUT "$n" 2>/dev/null || break
+    done
+    if ip6tables -w 10 -t mangle -I OUTPUT 1 "${spec[@]}" 2>/dev/null; then
+        rm -f "$OUTER_BYPASS_ERR_FILE"
+        log "tunnel: outer packets bypass UniFi mangle OUTPUT (rule #1)"
+    elif [[ ! -f "$OUTER_BYPASS_ERR_FILE" ]]; then
+        log "ERROR: failed to insert ip6tables mangle OUTPUT bypass for tunnel outer packets"
+        touch "$OUTER_BYPASS_ERR_FILE"
+    fi
+}
+
+ensure_tunnel_fwmark
+ensure_outer_mangle_bypass
 
 # --- 3. Ensure IPv4 address is on tunnel ---
 if ! ip addr show "$TUNNEL_NAME" 2>/dev/null | grep -q "$IPV4_ADDR"; then
