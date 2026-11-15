@@ -1,0 +1,7 @@
+[Unit]
+Description=UniFi native IPIP WAN guard
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/data/ipip-guard.sh
